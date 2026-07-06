@@ -1,23 +1,23 @@
 diff --git a/plugins/platforms/feishu/adapter.py b/plugins/platforms/feishu/adapter.py
-index ba18f22..1ed3ec0 100644
+index ba18f22..8bb7319 100644
 --- a/plugins/platforms/feishu/adapter.py
 +++ b/plugins/platforms/feishu/adapter.py
-@@ -1486,6 +1486,9 @@ class FeishuAdapter(BasePlatformAdapter):
-         # by create, so we cache it per message_id.
-         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
-         self._load_seen_message_ids()
+@@ -1482,6 +1482,14 @@ class FeishuAdapter(BasePlatformAdapter):
+         # Update prompt button state (prompt_id → {session_key, message_id, chat_id})
+         self._update_prompt_state: Dict[int, Dict[str, str]] = {}
+         self._update_prompt_counter = itertools.count(1)
 +        # Track message_ids sent as streaming cards, so edit_message knows
 +        # to update the card body instead of the text/post content.
 +        self._card_stream_messages: "set[str]" = set()
- 
-     @staticmethod
-     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
-@@ -1839,11 +1842,61 @@ class FeishuAdapter(BasePlatformAdapter):
-         reply_to: Optional[str] = None,
-         metadata: Optional[Dict[str, Any]] = None,
-     ) -> SendResult:
--        """Send a Feishu message."""
-+        """Send a Feishu message — try streaming card, fall back to text/post."""
++        # Streaming card incremental state: message_id → list of markdown chunks
++        # that have been committed as card elements.  Each edit appends a new
++        # element for the delta, avoiding O(N²) full-content reformatting.
++        self._stream_card_parts: "Dict[str, List[Dict[str, Any]]]" = {}
++        self._stream_card_chars: "Dict[str, int]" = {}  # message_id → chars already committed
+         # Feishu reaction deletion requires the opaque reaction_id returned
+         # by create, so we cache it per message_id.
+         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
+@@ -1843,7 +1851,43 @@ class FeishuAdapter(BasePlatformAdapter):
          if not self._client:
              return SendResult(success=False, error="Not connected")
  
@@ -28,14 +28,10 @@ index ba18f22..1ed3ec0 100644
 +        # can be progressively updated (streaming card).  Fall back to
 +        # text/post on failure.
          formatted = self.format_message(content)
-+        logger.info("[Feishu] send() trying card")
++        text_payload = self._build_stream_card_content(formatted, status="streaming")
++        logger.info("[Feishu] send() trying card: content_len=%s", len(formatted))
 +
 +        try:
-+            # Split into progressive chunks for true streaming card experience
-+            stream_chunks = self._split_stream_chunks(content)
-+            text_payload = self._build_stream_card_content(
-+                stream_chunks[0], status="streaming"
-+            )
 +            response = await self._feishu_send_with_retry(
 +                chat_id=chat_id,
 +                msg_type="interactive",
@@ -50,93 +46,86 @@ index ba18f22..1ed3ec0 100644
 +            if result.success and result.message_id:
 +                msg_id = str(result.message_id)
 +                self._card_stream_messages.add(msg_id)
-+                # Progressively update the card with remaining chunks
-+                if len(stream_chunks) > 1:
-+                    for i, chunk in enumerate(stream_chunks[1:], 1):
-+                        is_last = (i == len(stream_chunks) - 1)
-+                        try:
-+                            await self._edit_stream_card(
-+                                message_id=msg_id,
-+                                content=chunk,
-+                                finalize=is_last,
-+                            )
-+                            if not is_last:
-+                                await asyncio.sleep(0.6)
-+                        except Exception:
-+                            logger.warning(
-+                                "[Feishu] progressive card update %s/%s failed",
-+                                i, len(stream_chunks) - 1,
-+                            )
++                # Initialise incremental state so the first _edit_stream_card
++                # call doesn't re-process the content already sent as the
++                # initial card element.  We use len(content) (raw) because
++                # edit_message receives raw content for delta extraction.
++                self._stream_card_parts[msg_id] = [{"tag": "markdown", "content": formatted}]
++                self._stream_card_chars[msg_id] = len(content)
 +                return result
 +        except Exception as exc:
 +            logger.warning("[Feishu] send() card failed, falling to text: %s", exc)
 +
 +        logger.info("[Feishu] send() falling back to text message")
++        # Fall back to normal text message
          chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
          last_response = None
  
-@@ -1889,6 +1942,7 @@ class FeishuAdapter(BasePlatformAdapter):
-             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
-             return SendResult(success=False, error=str(exc))
- 
-+
-     async def edit_message(
-         self,
-         chat_id: str,
-@@ -1897,10 +1951,19 @@ class FeishuAdapter(BasePlatformAdapter):
+@@ -1896,11 +1940,22 @@ class FeishuAdapter(BasePlatformAdapter):
+         content: str,
          *,
          finalize: bool = False,
++        metadata: Optional[Dict[str, Any]] = None,
      ) -> SendResult:
 -        """Edit a previously sent Feishu text/post message."""
-+        """Edit a previously sent message — handles streaming card updates."""
++        """Edit a previously sent Feishu text/post/interactive-card message."""
          if not self._client:
              return SendResult(success=False, error="Not connected")
  
-+        # If this message is a streaming card, update via HTTP PATCH
++        # Streaming card edit path — edit the card's markdown body in place
++        # when the original message was sent as a streaming card.
 +        if message_id in self._card_stream_messages:
-+            return await self._edit_stream_card(
++            result = await self._edit_stream_card(
 +                message_id=message_id,
 +                content=content,
 +                finalize=finalize,
 +            )
++            return result
 +
-+        # Legacy text/post update path
          content = self.format_message(content)
          try:
              msg_type, payload = self._build_outbound_payload(content)
-@@ -1924,6 +1987,112 @@ class FeishuAdapter(BasePlatformAdapter):
+@@ -1924,6 +1979,113 @@ class FeishuAdapter(BasePlatformAdapter):
              logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
              return SendResult(success=False, error=str(exc))
  
++    # ------------------------------------------------------------------
++    # Streaming card helpers
++    # ------------------------------------------------------------------
 +
-+    @staticmethod
-+    def _build_stream_card_content(text: str, status: str = "streaming") -> str:
-+        """Build a Feishu interactive card JSON for streaming messages.
-+
-+        Args:
-+            text: The message content (markdown)
-+            status: One of "thinking", "streaming", "done"
-+
-+        Returns:
-+            JSON string suitable for Feishu interactive card msg_type
-+        """
-+        header_map = {
-+            "thinking": "🤖 Hermes 思考中...",
-+            "streaming": "🤖 Hermes",
-+            "done": "🤖 Hermes",
-+        }
-+        header_text = header_map.get(status, "🤖 Hermes")
-+        card = {
-+            "config": {"wide_screen_mode": True},
-+            "header": {
-+                "title": {"tag": "plain_text", "content": header_text},
-+                "template": "blue",
-+            },
-+            "elements": [
-+                {"tag": "markdown", "content": text},
-+            ],
-+        }
-+        return json.dumps(card, ensure_ascii=False)
++    async def _send_stream_card(
++        self,
++        *,
++        chat_id: str,
++        content: str,
++        reply_to: Optional[str] = None,
++        metadata: Optional[Dict[str, Any]] = None,
++    ) -> SendResult:
++        """Send the initial interactive card for a streaming response."""
++        payload = self._build_stream_card_content(content, status="thinking")
++        logger.info("[Feishu] _send_stream_card: sending card msg_type=interactive, content_len=%s", len(payload))
++        try:
++            response = await self._feishu_send_with_retry(
++                chat_id=chat_id,
++                msg_type="interactive",
++                payload=payload,
++                reply_to=reply_to,
++                metadata=metadata,
++            )
++            result = self._finalize_send_result(response, "stream_card send failed")
++            logger.info("[Feishu] _send_stream_card result: success=%s message_id=%s",
++                        result.success, result.message_id)
++            if not result.success:
++                logger.warning("[Feishu] _send_stream_card failed: %s", result.error)
++                # Try to log the raw response for debugging
++                raw = getattr(result, "raw_response", None)
++                if raw is not None:
++                    logger.warning("[Feishu] _send_stream_card raw_response: code=%s msg=%s",
++                                   getattr(raw, "code", "?"), getattr(raw, "msg", "?"))
++            return result
++        except Exception as exc:
++            logger.error("[Feishu] Failed to send stream card: %s", exc, exc_info=True)
++            return SendResult(success=False, error=str(exc))
 +
 +    async def _edit_stream_card(
 +        self,
@@ -145,122 +134,197 @@ index ba18f22..1ed3ec0 100644
 +        content: str,
 +        finalize: bool = False,
 +    ) -> SendResult:
-+        """Update the markdown body of a streaming card via raw HTTP PATCH.
++        """Incremental update of a streaming card body.
 +
-+        Uses direct HTTP instead of the lark_oapi SDK because the SDK's
-+        UpdateMessageRequestBody builder fails field validation for
-+        interactive cards.
++        Instead of rebuilding the entire card from scratch on every edit,
++        this method tracks the number of characters already committed and
++        only processes the *delta* — the new text since the last update.
++        Each delta is ``format_message``-ed once and appended as a new
++        markdown element, so the card grows element by element and total
++        processing cost is O(N) rather than O(N²).
 +        """
++        # Retrieve or initialise incremental state for this message.
++        elements = self._stream_card_parts.get(message_id)
++        if elements is None:
++            # First edit on this message — initialise with an empty list
++            # and let the delta capture the full content.
++            elements = []
++            self._stream_card_parts[message_id] = elements
++            self._stream_card_chars[message_id] = 0
++
++        sent_chars = self._stream_card_chars.get(message_id, 0)
++        delta = content[sent_chars:] if len(content) > sent_chars else ""
++
++        if delta:
++            formatted_delta = self.format_message(delta)
++            if formatted_delta.strip():
++                elements.append({"tag": "markdown", "content": formatted_delta})
++                self._stream_card_chars[message_id] = len(content)
++
 +        try:
-+            access_token = self._fetch_feishu_token()
++            status = "done" if finalize else "streaming"
++            payload = self._build_stream_card_from_elements(elements, status=status)
++            token = await self._run_blocking(self._fetch_feishu_token)
++            if not token:
++                logger.warning("[Feishu] _edit_stream_card: no token, skipping card edit")
++                return SendResult(success=False, error="no Feishu token")
 +            url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}"
-+            body_data = json.dumps({"content": self._build_stream_card_content(
-+                content, status="done" if finalize else "streaming")})
 +            headers = {
-+                "Authorization": f"Bearer {access_token}",
-+                "Content-Type": "application/json; charset=utf-8",
++                "Content-Type": "application/json",
++                "Authorization": f"Bearer {token}",
 +            }
++            body_data = json.dumps({"content": payload}, ensure_ascii=False)
++
 +            resp = await self._run_blocking(
 +                lambda: self._http_patch(url, headers=headers, body=body_data),
 +            )
-+            if resp.get("code") == 0:
-+                logger.info("[Feishu] Card updated successfully for %s (finalize=%s)", message_id, finalize)
++            code = resp.get("code", -1) if isinstance(resp, dict) else -1
++            if code == 0:
++                logger.info("[Feishu] _edit_stream_card ok: msg_id=%s final=%s parts=%s",
++                            message_id, finalize, len(elements))
++                if finalize:
++                    # Free per-message state — card is done, no more edits
++                    self._card_stream_messages.discard(message_id)
++                    self._stream_card_parts.pop(message_id, None)
++                    self._stream_card_chars.pop(message_id, None)
 +                return SendResult(success=True, message_id=message_id)
 +            else:
-+                error_msg = resp.get("msg", "unknown error")
-+                logger.warning("[Feishu] Card update failed for %s: %s", message_id, error_msg)
-+                return SendResult(success=False, error=f"Card update failed: {error_msg}")
++                msg = resp.get("msg", "unknown") if isinstance(resp, dict) else str(resp)
++                logger.warning("[Feishu] _edit_stream_card failed: code=%s msg=%s", code, msg)
++                return SendResult(success=False, error=f"card update failed: {msg}")
 +        except Exception as exc:
-+            logger.error("[Feishu] _edit_stream_card error %s: %s", message_id, exc)
++            logger.error("[Feishu] _edit_stream_card error %s: %s", message_id, exc, exc_info=True)
 +            return SendResult(success=False, error=str(exc))
-+
-+    @staticmethod
-+    def _split_stream_chunks(text: str, max_chunks: int = 4) -> list:
-+        """Split text into cumulative progressive chunks for streaming card updates.
-+
-+        Returns a list of strings where each chunk is a prefix of the full text.
-+        Short messages (<150 chars) return [text] — no split.
-+        The last chunk is always the full text.
-+        """
-+        if len(text) < 150:
-+            return [text]
-+
-+        total_len = len(text)
-+        positions = []
-+        for i in range(1, max_chunks + 1):
-+            target_pos = int(total_len * i / max_chunks)
-+            if i < max_chunks:
-+                # Try to break at a paragraph boundary for cleaner updates
-+                window_start = max(0, target_pos - 60)
-+                nl2_pos = text.rfind('\n\n', window_start, target_pos)
-+                if nl2_pos > 0:
-+                    target_pos = nl2_pos + 2  # include the \n\n
-+                else:
-+                    nl_pos = text.rfind('\n', window_start, target_pos)
-+                    if nl_pos > 0:
-+                        target_pos = nl_pos + 1  # include the \n
-+            positions.append(target_pos)
-+
-+        chunks = []
-+        for pos in positions:
-+            chunks.append(text[:pos])
-+
-+        # Deduplicate consecutive identical chunks
-+        deduped = [chunks[0]]
-+        for c in chunks[1:]:
-+            if c != deduped[-1]:
-+                deduped.append(c)
-+
-+        deduped[-1] = text  # last chunk is always the full text
-+        return deduped
 +
      async def send_exec_approval(
          self, chat_id: str, command: str, session_key: str,
          description: str = "dangerous command",
-@@ -4878,6 +5047,47 @@ class FeishuAdapter(BasePlatformAdapter):
+@@ -2096,6 +2258,68 @@ class FeishuAdapter(BasePlatformAdapter):
+             ],
+         }
+ 
++    # -----------------------------------------------------------------------
++    # Streaming card — interactive card that is progressively updated during
++    # LLM streaming.  Enabled when send() / edit_message() receive
++    # ``stream_card: True`` in metadata.
++    # -----------------------------------------------------------------------
++
++    STREAM_CARD_HEADERS = {
++        "thinking": "🤖 Hermes 思考中...",
++        "streaming": "🤖 Hermes",
++        "done": "🤖 Hermes",
++    }
++    STREAM_CARD_TEMPLATES = {
++        "thinking": "blue",
++        "streaming": "blue",
++        "done": "blue",
++    }
++
++    @staticmethod
++    def _build_stream_card_content(text: str, *, status: str = "streaming") -> str:
++        """Build an interactive card payload for streaming conversation.
++
++        The card uses a header + markdown-body layout that can be
++        progressively updated via :meth:`edit_message` as the agent
++        generates its response.
++
++        *status* controls the header text and template colour:
++        ``"thinking"`` / ``"streaming"`` / ``"done"``.
++        """
++        title = FeishuAdapter.STREAM_CARD_HEADERS.get(status, "🤖 Hermes")
++        template = FeishuAdapter.STREAM_CARD_TEMPLATES.get(status, "blue")
++        card = {
++            "config": {"wide_screen_mode": True},
++            "header": {
++                "title": {"tag": "plain_text", "content": title},
++                "template": template,
++            },
++            "elements": [
++                {"tag": "markdown", "content": text or ""},
++            ],
++        }
++        return json.dumps(card, ensure_ascii=False)
++
++    @staticmethod
++    def _build_stream_card_from_elements(elements: "List[Dict[str, Any]]", *, status: str = "streaming") -> str:
++        """Build a streaming card JSON from a list of pre-built card elements.
++
++        Each element is a full card element dict (e.g. ``{"tag": "markdown", "content": "..."}``).
++        Used by the incremental update path where new content is appended as
++        an additional markdown element rather than replacing the entire body.
++        """
++        title = FeishuAdapter.STREAM_CARD_HEADERS.get(status, "🤖 Hermes")
++        template = FeishuAdapter.STREAM_CARD_TEMPLATES.get(status, "blue")
++        card = {
++            "config": {"wide_screen_mode": True},
++            "header": {
++                "title": {"tag": "plain_text", "content": title},
++                "template": template,
++            },
++            "elements": elements if elements else [{"tag": "markdown", "content": "..."}],
++        }
++        return json.dumps(card, ensure_ascii=False)
++
+     @staticmethod
+     def _write_update_prompt_response(answer: str) -> None:
+         response_path = get_hermes_home() / ".update_response"
+@@ -4878,6 +5102,60 @@ class FeishuAdapter(BasePlatformAdapter):
              )
          return SimpleNamespace(message_id=message_id, request_body=request_body)
  
-+    @staticmethod
-+    def _fetch_feishu_token(app_id: str = None, app_secret: str = None) -> str:
-+        """Get a Feishu tenant access token via HTTP POST."""
-+        import urllib.request, urllib.parse
-+        if not app_id or not app_secret:
-+            app_id = os.getenv("FEISHU_APP_ID", "")
-+            app_secret = os.getenv("FEISHU_APP_SECRET", "")
-+        data = json.dumps({
-+            "app_id": app_id,
-+            "app_secret": app_secret,
++    def _fetch_feishu_token(self) -> Optional[str]:
++        """Fetch a tenant access token via direct HTTP call.
++
++        Used by :meth:`_edit_stream_card` to bypass lark_oapi SDK validation
++        issues with interactive card updates.  Falls back to ``httpx`` if
++        available, otherwise ``urllib.request``.
++        """
++        import json as _json
++        _data = _json.dumps({
++            "app_id": self._app_id,
++            "app_secret": self._app_secret,
 +        }).encode("utf-8")
-+        req = urllib.request.Request(
-+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-+            data=data,
-+            headers={"Content-Type": "application/json; charset=utf-8"},
-+            method="POST",
-+        )
-+        with urllib.request.urlopen(req, timeout=10) as resp:
-+            result = json.loads(resp.read().decode("utf-8"))
-+        return result.get("tenant_access_token", "")
++        try:
++            import httpx
++            r = httpx.post(
++                "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
++                content=_data,
++                headers={"Content-Type": "application/json"},
++                timeout=10,
++            )
++            return r.json().get("tenant_access_token")
++        except ImportError:
++            from urllib.request import Request, urlopen
++            req = Request(
++                "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
++                data=_data,
++                headers={"Content-Type": "application/json"},
++            )
++            with urlopen(req, timeout=10) as resp:
++                return _json.loads(resp.read().decode("utf-8")).get("tenant_access_token")
++        except Exception as exc:
++            logger.error("[Feishu] _fetch_feishu_token failed: %s", exc)
++            return None
 +
 +    @staticmethod
-+    def _http_patch(url: str, headers: dict, body: str) -> dict:
-+        """Make an HTTP PATCH request and return the JSON response."""
-+        import urllib.request
-+        data = body.encode("utf-8") if isinstance(body, str) else body
-+        req = urllib.request.Request(
-+            url, data=data, headers=headers, method="PATCH",
-+        )
-+        with urllib.request.urlopen(req, timeout=15) as resp:
-+            return json.loads(resp.read().decode("utf-8"))
++    def _http_patch(url: str, headers: dict, body: str) -> Any:
++        """Make an HTTP PATCH request and return a response-lik eobject.
 +
-+        if "UpdateMessageRequest" in globals():
-+            return (
-+                UpdateMessageRequest.builder()
-+                .message_id(message_id)
-+                .request_body(request_body)
-+                .build()
-+            )
-+        return SimpleNamespace(message_id=message_id, request_body=request_body)
++        Used by :meth:`_edit_stream_card` to update interactive card content
++        via raw HTTP instead of the lark_oapi SDK.
++        """
++        import json as _json
++        try:
++            import httpx
++            r = httpx.patch(url, headers=headers, content=body, timeout=10)
++            return _json.loads(r.text)
++        except ImportError:
++            from urllib.request import Request, urlopen
++            req = Request(url, data=body.encode("utf-8"), headers=headers, method="PATCH")
++            with urlopen(req, timeout=10) as resp:
++                return _json.loads(resp.read().decode("utf-8"))
++        except Exception as exc:
++            return {"code": -1, "msg": str(exc)}
 +
      @staticmethod
      def _build_create_message_body(*, receive_id: str, msg_type: str, content: str, uuid_value: str) -> Any:

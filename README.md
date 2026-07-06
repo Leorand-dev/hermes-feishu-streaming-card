@@ -1,24 +1,71 @@
 # Feishu Streaming Card — Hermes Agent Patch
 
-Hermes Agent 飞书适配器增量流式卡片补丁。
+Hermes Agent 飞书适配器**真正的增量流式卡片**补丁。
 
 ## 解决的问题
 
-Hermes Agent v0.18.0 的飞书适配器虽然内置了流式卡片接口（`_card_stream_messages` + `_edit_stream_card`），
-但 `send()` 方法始终一次性发送完整内容，用户只看到卡片一次性弹出，没有增量填充效果。
+Hermes Agent 飞书适配器虽然能发送交互卡片，但流式编辑的实现是 **O(N²) 的**：
+
+```
+旧实现（每步重发全文）:
+  edit#1: format_message(1000 chars) → 重建 → PATCH(1000ch)
+  edit#2: format_message(2000 chars) → 重建 → PATCH(2000ch)  ← 1000 chars 重复处理
+  edit#3: format_message(3000 chars) → 重建 → PATCH(3000ch)  ← 2000 chars 重复处理
+  …总处理量 O(N²)…
+```
+
+长响应时这种全量重建浪费严重，且卡片内容整个闪烁替换，视觉不流畅。
 
 ## 原理
 
-```
-Before (原版):
-  模型生成完整回复 → send(完整内容) → 一次性弹出卡片
+本补丁实现**按字符位置跟踪的增量 delta 追加**：
 
-After (补丁后):
-  模型生成完整回复 → send(完整内容) → 拆分为4段累积内容
-    → 发第1段（初始卡片）
-    → 0.6s后 PATCH 更新为第1+2段
-    → 0.6s后 PATCH 更新为第1+2+3段
-    → 0.6s后 PATCH 最终版（完整内容）
+```
+新实现（增量 delta 追加）:
+  send:   format_message(initial) → 发初始卡片 (1 个 markdown 元素)
+          存储: sent_chars = len(content), elements = [element1]
+
+  edit#1: delta = content[sent_chars:]  ← 只取新字符
+          format_message(delta)          ← 只处理 delta
+          elements.append({tag:"markdown", content:formatted_delta})
+          PATCH(所有 elements)           ← 卡片追加新元素
+
+  edit#2: delta = content[sent_chars:]  ← 又一批新字符
+          format_message(delta)          ← 只处理新内容
+          elements.append(...)           ← 再追加一个元素
+          PATCH(所有 elements)           ← 卡片又多一段
+
+  finalize: 更新 header 为 "done"，清理临时状态
+  …总处理量 O(N)…
+```
+
+**卡片视觉**：不再是整个内容闪烁替换，而是像聊天记录一样**逐段生长**，每段独立渲染。
+
+## 架构
+
+```
+┌───────────────────────────────────────────────────┐
+│               _card_stream_messages               │
+│               (消息 ID 集合: 哪些是卡片)           │
+├───────────────────────────────────────────────────┤
+│  _stream_card_parts[msg_id]  = [element1, ...]    │
+│  _stream_card_chars[msg_id]  = 已提交字符数        │
+│                                                    │
+│  send():                                           │
+│    → 建初始元素, 初始化 _stream_card_parts/chars   │
+│    → 发送卡片                                      │
+│                                                    │
+│  edit_message() → _edit_stream_card():             │
+│    → delta = content[sent_chars:]                  │
+│    → 如有 delta: format + append element           │
+│    → _build_stream_card_from_elements(elements)    │
+│    → HTTP PATCH                                    │
+│                                                    │
+│  finalize=True:                                    │
+│    → header 改为 "done"                            │
+│    → 清理 _stream_card_parts/chars                 │
+│    → 清理 _card_stream_messages                    │
+└───────────────────────────────────────────────────┘
 ```
 
 ## 安装
@@ -28,42 +75,50 @@ After (补丁后):
 cd ~/.hermes/hermes-agent
 
 # 2. 应用补丁
-git apply patches/feishu-streaming-card.patch
+git apply /path/to/feishu-streaming-card.patch
 
 # 3. 重启 Gateway（见下方）
 ```
 
 ## 重启 Gateway
 
-Gateway 无法自杀，用独立进程脚本重启：
+Gateway 无法自杀。在**另一个终端窗口**执行：
 
 ```bash
-python3 patches/restart-gateway.py
+hermes gateway restart
 ```
 
-> ⚠️ 脚本中的 `GW_PID` 需根据实际 gateway PID 修改。先用 `ps aux | grep "hermes.*gateway"` 查看。
+或：
+
+```bash
+sudo systemctl restart hermes-gateway
+```
 
 ## 升级后恢复
 
-每次 `git pull` 升级 Hermes 后，重新 apply 补丁即可：
+每次 `git pull` 升级 Hermes 后，重新 apply 补丁：
 
 ```bash
 cd ~/.hermes/hermes-agent
 git pull
-git apply ~/.local/share/weather-cron/patches/feishu-streaming-card.patch
+git apply /path/to/feishu-streaming-card.patch
+sudo systemctl restart hermes-gateway
 ```
 
-## 技术细节
+## 核心 API 变更
 
-- **短消息不拆分**：< 150 字符的消息直接发送，不流式
-- **段落感知**：拆分会优先在段落边界（`\n\n`）处断开，避免截断句子
-- **去重保护**：连续相同内容的 chunk 自动合并
-- **错误容忍**：某个中间更新失败不影响最终结果
-- **延迟**：每次更新间隔 0.6 秒，共 3 次更新（4 段 → 完整）
+| 方法 | 变更 |
+|------|------|
+| `__init__` | 新增 `_stream_card_parts`, `_stream_card_chars` 字典 |
+| `send()` | 发送卡片后初始化增量状态，初始元素 + sent_chars |
+| `edit_message()` | 路由到 `_edit_stream_card`，去掉重复清理 |
+| `_edit_stream_card` | **完全重写**：delta 提取 → 元素追加 → 多元素卡片 |
+| `_build_stream_card_content` | 保持单元素构建（用于 send） |
+| **新增** `_build_stream_card_from_elements` | 从元素列表构建多元素卡片 |
 
 ## 文件
 
 | 文件 | 说明 |
 |------|------|
-| `feishu-streaming-card.patch` | adapter.py 补丁（新增 `_split_stream_chunks` + 修改 `send()`） |
+| `feishu-streaming-card.patch` | adapter.py 完整补丁（含增量更新逻辑） |
 | `restart-gateway.py` | 独立进程重启 gateway 脚本 |
