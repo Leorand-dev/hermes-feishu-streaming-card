@@ -1,124 +1,134 @@
 # Feishu Streaming Card — Hermes Agent Patch
 
-Hermes Agent 飞书适配器**真正的增量流式卡片**补丁。
+Hermes Agent 飞书适配器**真正的增量流式卡片**。文档+补丁+完整源码+一键部署脚本，clone 即用。
 
-## 解决的问题
+---
 
-Hermes Agent 飞书适配器虽然能发送交互卡片，但流式编辑的实现是 **O(N²) 的**：
+## 效果
 
-```
-旧实现（每步重发全文）:
-  edit#1: format_message(1000 chars) → 重建 → PATCH(1000ch)
-  edit#2: format_message(2000 chars) → 重建 → PATCH(2000ch)  ← 1000 chars 重复处理
-  edit#3: format_message(3000 chars) → 重建 → PATCH(3000ch)  ← 2000 chars 重复处理
-  …总处理量 O(N²)…
-```
+飞书对话中，Hermes 的回复不再是"一次性弹出"或"全量闪烁替换"，而是像打字机一样**逐段生长**。每个新段落作为新的卡片元素追加，视觉流畅，开销 O(N) 而非 O(N²)。
 
-长响应时这种全量重建浪费严重，且卡片内容整个闪烁替换，视觉不流畅。
-
-## 原理
-
-本补丁实现**按字符位置跟踪的增量 delta 追加**：
+## 项目结构
 
 ```
-新实现（增量 delta 追加）:
-  send:   format_message(initial) → 发初始卡片 (1 个 markdown 元素)
-          存储: sent_chars = len(content), elements = [element1]
-
-  edit#1: delta = content[sent_chars:]  ← 只取新字符
-          format_message(delta)          ← 只处理 delta
-          elements.append({tag:"markdown", content:formatted_delta})
-          PATCH(所有 elements)           ← 卡片追加新元素
-
-  edit#2: delta = content[sent_chars:]  ← 又一批新字符
-          format_message(delta)          ← 只处理新内容
-          elements.append(...)           ← 再追加一个元素
-          PATCH(所有 elements)           ← 卡片又多一段
-
-  finalize: 更新 header 为 "done"，清理临时状态
-  …总处理量 O(N)…
+hermes-feishu-streaming-card/
+├── deploy.sh                    # 一键部署脚本（推荐）
+├── feishu-streaming-card.patch  # 补丁文件
+├── restart-gateway.py           # 独立进程重启脚本
+├── README.md                    # 本文件
+└── src/
+    └── adapter.py               # 完整修改后的 adapter.py（可直接替换）
 ```
 
-**卡片视觉**：不再是整个内容闪烁替换，而是像聊天记录一样**逐段生长**，每段独立渲染。
+| 文件 | 说明 |
+|------|------|
+| `deploy.sh` | **一键部署**：备份原文件 → 应用补丁 → 语法验证 → 重启提示 |
+| `feishu-streaming-card.patch` | 与 Hermes `main` 分支的 git diff 补丁 |
+| `src/adapter.py` | 完整的适配器源码（已包含所有改动） |
+| `restart-gateway.py` | 独立进程重启 gateway（替代 `sudo systemctl`） |
 
-## 架构
-
-```
-┌───────────────────────────────────────────────────┐
-│               _card_stream_messages               │
-│               (消息 ID 集合: 哪些是卡片)           │
-├───────────────────────────────────────────────────┤
-│  _stream_card_parts[msg_id]  = [element1, ...]    │
-│  _stream_card_chars[msg_id]  = 已提交字符数        │
-│                                                    │
-│  send():                                           │
-│    → 建初始元素, 初始化 _stream_card_parts/chars   │
-│    → 发送卡片                                      │
-│                                                    │
-│  edit_message() → _edit_stream_card():             │
-│    → delta = content[sent_chars:]                  │
-│    → 如有 delta: format + append element           │
-│    → _build_stream_card_from_elements(elements)    │
-│    → HTTP PATCH                                    │
-│                                                    │
-│  finalize=True:                                    │
-│    → header 改为 "done"                            │
-│    → 清理 _stream_card_parts/chars                 │
-│    → 清理 _card_stream_messages                    │
-└───────────────────────────────────────────────────┘
-```
-
-## 安装
+## 快速部署
 
 ```bash
-# 1. 进入 Hermes Agent 目录
+# 方法一：一键脚本（推荐）
+git clone https://github.com/Leorand-dev/hermes-feishu-streaming-card.git
+cd hermes-feishu-streaming-card
+bash deploy.sh
+
+# 方法二：手动复制
+cp src/adapter.py ~/.hermes/hermes-agent/plugins/platforms/feishu/adapter.py
+
+# 方法三：Git 补丁
 cd ~/.hermes/hermes-agent
-
-# 2. 应用补丁
 git apply /path/to/feishu-streaming-card.patch
-
-# 3. 重启 Gateway（见下方）
 ```
 
-## 重启 Gateway
-
-Gateway 无法自杀。在**另一个终端窗口**执行：
-
-```bash
-hermes gateway restart
-```
-
-或：
+### 重启 Gateway
 
 ```bash
 sudo systemctl restart hermes-gateway
 ```
 
-## 升级后恢复
+> ⚠️ Gateway 不能从内部自行重启。请从另一个终端窗口执行。
 
-每次 `git pull` 升级 Hermes 后，重新 apply 补丁：
+升级 Hermes 后重新部署即可恢复补丁：
 
 ```bash
 cd ~/.hermes/hermes-agent
 git pull
-git apply /path/to/feishu-streaming-card.patch
-sudo systemctl restart hermes-gateway
+bash /path/to/hermes-feishu-streaming-card/deploy.sh
 ```
 
-## 核心 API 变更
+## 架构
 
-| 方法 | 变更 |
+### 旧实现（全量重建，O(N²)）
+
+```
+每步重建整个卡片，已发送的内容被反复处理：
+edit#1: format_message(1000 chars) → 整个卡片 PATCH(1000ch)
+edit#2: format_message(2000 chars) → 整个卡片 PATCH(2000ch)  ← 1000 chars 重处理
+edit#3: format_message(3000 chars) → 整个卡片 PATCH(3000ch)  ← 2000 chars 重处理
+```
+
+### 新实现（增量 delta 追加，O(N)）
+
+```
+按字符位置追踪已提交的内容，每步只处理新增部分：
+send:   format_message(initial) → 发初始卡片（1 个 markdown 元素）
+        sent_chars = len(content), elements = [element1]
+
+edit#1: delta = content[sent_chars:]     ← 只取新字符
+        format_message(delta)            ← 只处理 delta
+        elements.append(new element)     ← 追加新元素
+        PATCH(所有 elements)
+
+edit#2: delta = content[sent_chars:]     ← 又一批新字符
+        format_message(delta)
+        elements.append(...)             ← 再追加一个元素
+        PATCH(所有 elements)
+
+finalize: header 改为 "done", 清理状态
+```
+
+## 核心改动
+
+```
+__init__
+  └─ _stream_card_parts[msg_id] = List[markdown_element_dict]
+  └─ _stream_card_chars[msg_id] = int  # 已提交的字符数
+
+send()
+  └─ _build_stream_card_content(formatted)   → 发初始卡片
+  └─ 初始化增量状态: _stream_card_parts + _stream_card_chars
+
+edit_message()
+  └─ message_id in _card_stream_messages?
+     ├─ 是 → _edit_stream_card()   (增量路径)
+     └─ 否 → 原编辑逻辑
+
+_edit_stream_card()  [核心]
+  └─ delta = content[sent_chars:]           ← 提取增量
+  └─ if delta: format + append element      ← 只处理新内容
+  └─ _build_stream_card_from_elements()     ← 从已积累的元素构建
+  └─ HTTP PATCH → 飞书
+  └─ finalize=True: 清理状态
+
+_build_stream_card_from_elements()
+  └─ elements 列表 + header → 完整卡片 JSON
+```
+
+## 边界处理
+
+| 场景 | 行为 |
 |------|------|
-| `__init__` | 新增 `_stream_card_parts`, `_stream_card_chars` 字典 |
-| `send()` | 发送卡片后初始化增量状态，初始元素 + sent_chars |
-| `edit_message()` | 路由到 `_edit_stream_card`，去掉重复清理 |
-| `_edit_stream_card` | **完全重写**：delta 提取 → 元素追加 → 多元素卡片 |
-| `_build_stream_card_content` | 保持单元素构建（用于 send） |
-| **新增** `_build_stream_card_from_elements` | 从元素列表构建多元素卡片 |
+| 首次编辑（无状态） | 初始化为空列表，delta 全量捕获 |
+| HTTP PATCH 失败 | 状态保留，下次编辑可继续追加 |
+| finalize PATCH 成功 | 自动清理 `_stream_card_parts` + `_card_stream_messages` |
+| finalize PATCH 失败 | 状态保留，不会泄漏 |
+| `format_message()` 改变长度 | `sent_chars` 基于原始 `content` 长度，与 delta 提取一致 |
 
-## 文件
+## 依赖
 
-| 文件 | 说明 |
-|------|------|
-| `feishu-streaming-card.patch` | adapter.py 完整补丁（含增量更新逻辑） |
-| `restart-gateway.py` | 独立进程重启 gateway 脚本 |
+- Hermes Agent（任意版本，`adapter.py` 含 `edit_message` 接口）
+- Python 3.10+
+- Feishu/Lark 机器人凭证（配置于 `~/.hermes/.env`）
